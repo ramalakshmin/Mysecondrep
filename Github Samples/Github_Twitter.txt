@@ -1,0 +1,3 @@
+https://gist.github.com/techslides
+http://haacked.com/archive/2014/04/24/octokit-oauth/
+http://www.sitepoint.com/use-githubs-api-php/
