@@ -1,0 +1,979 @@
+CREATE OR REPLACE PROCEDURE UP_ARCPDeleteArchivedData
+(
+ ppActionId         NUMBER,
+ ppArchivalIndexIds VARCHAR2,
+ ppParticipantId    NUMBER,
+ ppResult           OUT VARCHAR2,
+ ppUserId           NUMBER,
+ ppCurrentDateTime  TIMESTAMP,
+ PORARC1 OUT VeraciousPkg.REF_CURSOR
+)
+
+ AS
+
+  v_SqlStr      VARCHAR2(4000);
+  v_VActionId   NUMBER;
+  v_EligStatus  VARCHAR2(50);
+  v_FinalStatus VARCHAR2(50);
+  v_vState      VARCHAR2(32);
+  v_vContext    VARCHAR2(32);
+  v_vStateType  CHAR(1);
+  v_UserName    VARCHAR2(50);
+  v_DeleteData  CHAR(1);
+  T1            TIMESTAMP;
+  T2            TIMESTAMP;
+  curTable      veraciouspkg.REF_CURSOR;
+  TYPE TBL_VC32	IS TABLE OF VARCHAR2(32);
+  tbl_rowid			 TBL_VC32;
+
+  curGetTranPassStat veraciouspkg.REF_CURSOR;
+
+BEGIN
+  EXECUTE IMMEDIATE 'ALTER TRIGGER TRIG_TRANSACTIONDETAILS_DEL DISABLE';
+  DELETE FROM TEMP_EXCHANGEFILES;
+  DELETE FROM TEMP_TRANIDS;
+  DELETE FROM TEMP_KETRANIDS;
+  DELETE FROM TEMP_TRAN;
+  DELETE FROM TEMP_BLOCKTICKET;
+
+
+   T1 := SYSTIMESTAMP;
+  v_SqlStr := 'INSERT INTO TEMPINDEX SELECT ArchivalId FROM ARCHIVALINDEX WHERE ArchivalId IN (' ||
+              ppArchivalIndexIds || ') ';
+  EXECUTE IMMEDIATE v_SqlStr;
+  T2 := SYSTIMESTAMP;
+  DBMS_OUTPUT.PUT_LINE(' insert tempindex ' || (T2-T1));
+
+   T1 := SYSTIMESTAMP;
+  -- TRANSACTIONIDs
+  INSERT INTO TEMP_TRANIDS (PaymentItemId, AchTransactionId, TPHId)
+         SELECT T.Paymentitemid, T.AchTransactionId, TPH.Id
+              FROM TRANSACTIONPROCESSHEADER TPH
+             INNER JOIN TRANSACTIONS T ON T.AchTransactionId = TPH.AchTransactionId
+             INNER JOIN TEMPINDEX TI ON T.ArchivalId = TI.Id;
+
+  -- KETRANSACTIONIDs
+  INSERT INTO TEMP_KETRANIDS (KEFileId, KETrayId, KEBatchId, KETranId)
+         SELECT KEF.Id, KT.Id, KEB.Id, KET.Id
+              FROM KETRANSACTIONS KET
+              INNER JOIN TEMP_TRANIDS TTID ON TTID.TPHId = KET.PROCESSHEADERID
+              INNER JOIN KEBATCHES KEB ON KEB.Id = KET.KeBatchId
+              INNER JOIN KETRAYS KT ON KT.Id = KEB.KETrayId
+              INNER JOIN KEFILES KEF ON KEF.Id = KT.KeFileId;
+  T2 := SYSTIMESTAMP;
+  DBMS_OUTPUT.PUT_LINE(' insert temp tranids ' || (T2-T1));
+
+
+   BEGIN
+      SELECT LoginName INTO v_UserName FROM USERS WHERE UserId = ppUserId AND ROWNUM=1;
+   EXCEPTION WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20000,'USER NOT FOUND ' );
+   END;
+
+  -- GET VIEW ACTIONID FOR THE CURRENT PROCESS ACTIONID
+  v_VActionId := 0;
+  BEGIN
+   SELECT NVL(WFA.ViewAction, 0) INTO v_VActionId
+   FROM WFActions WFA
+   WHERE WFA.Id = ppActionId  AND ROWNUM=1;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+   RAISE_APPLICATION_ERROR(-20000,'VIEW ACTION NOT FOUND');
+  END;
+
+  v_EligStatus  := ' ';
+  v_FinalStatus := ' ';
+  v_vState      := ' ';
+  v_vContext    := ' ';
+  v_vStateType  := ' ';
+
+  -- GET ELIGIBLE, FINAL STATUS FOR PROCESS OBJECTS
+  v_SqlStr := 'SELECT WFAS.State, WFAS.Context, WFAS.StateType FROM WFACTIONSTATES WFAS ' ||
+              ' WHERE UPPER(WFAS.ObjectCode)= ''AI'' AND WFAS.ActionID IN (' ||
+              TO_CHAR(ppActionId) || ',' || TO_CHAR(v_VActionId) ||
+              ')  GROUP BY WFAS.State, WFAS.StateType, WFAS.Context ';
+
+  OPEN curGetTranPassStat FOR v_SqlStr;
+  LOOP
+    FETCH curGetTranPassStat
+      INTO v_vState, v_vContext, v_vStateType;
+    EXIT WHEN curGetTranPassStat%NOTFOUND;
+    IF v_vStateType = 'F' THEN
+      v_FinalStatus := v_vState;
+    END IF;
+    IF v_vStateType = 'E' THEN
+      IF NVL(v_EligStatus,' ') <> ' ' THEN
+        v_EligStatus := v_EligStatus || ',';
+      END IF;
+      v_EligStatus := v_EligStatus || ' ''' || v_vState || ''' ';
+    END IF;
+
+  END LOOP;
+  CLOSE curGetTranPassStat;
+
+
+  -- GETTING ARCHIVALDELETE INFO VALUE FROM "SYSTEMSETUP"
+  v_DeleteData := 'N';
+ BEGIN
+    SELECT NVL(FirstValue, 'N')
+      INTO v_DeleteData
+      FROM SYSTEMSETUP
+     WHERE UPPER(SetupName) = 'DELETEARCHIVALDATA'  AND ROWNUM=1;
+ EXCEPTION WHEN NO_DATA_FOUND THEN
+      v_DeleteData := 'N';
+ END;
+  -------------------------------
+
+  IF v_DeleteData = 'Y' THEN
+
+    ----- ******************* --------
+   T1 := SYSTIMESTAMP;
+    -- ARCHIVEDTRANSACTIONS - INSERT
+    INSERT INTO ARCHIVEDTRANSACTIONS
+      (AchTransactionId,
+       RoutingNo,
+       CheckNo,
+       AccountNo,
+       PresentmentCount,
+       ProcessType,
+       PaymentMethod)
+      SELECT T.AchTransactionId,
+             T.RoutingNo,
+             T.CheckNo,
+             T.AccountNo,
+             B.PresentmentCount,
+             B.ProcessType,
+             T.PaymentMethod
+        FROM TRANSACTIONS T
+       INNER JOIN TRANSACTIONPROCESSHEADER TPH ON T.AchTransactionId =
+                                                  TPH.AchTransactionId
+       INNER JOIN BATCH B ON B.AchBatchId = TPH.AchBatchId
+       WHERE T.AchTransactionId IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);
+ T2 := SYSTIMESTAMP;
+  DBMS_OUTPUT.PUT_LINE(' insert ARCHIVEDTRANSACTIONS ' || (T2-T1));
+
+    ----- ******************* --------
+
+     T1 := SYSTIMESTAMP;
+    -- ExchangeImageData Delete
+     DELETE FROM EXCHANGEIMAGEDATA;
+     T2 := SYSTIMESTAMP;
+     DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGEIMAGEDATA ' || (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+     -- SYSTEMACTIVITYLOG - DELETE
+     OPEN curTable FOR SELECT SAL.ROWID
+           FROM SYSTEMACTIVITYLOG SAL
+           WHERE ArchivalId IN (SELECT Id FROM TEMPINDEX);
+
+      LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+      EXIT WHEN tbl_rowid.COUNT =0;
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM SYSTEMACTIVITYLOG
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+
+    CLOSE curTable;
+
+    --DELETE FROM SYSTEMACTIVITYLOG WHERE ArchivalId IN (SELECT Id FROM TEMPINDEX);
+    T2 := SYSTIMESTAMP;
+
+     DBMS_OUTPUT.PUT_LINE(' DELETE SYSTEMACTIVITYLOG ' || SQL%rowcount ||  (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- GLSETTLEMENTDETAILS - DELETE
+    DELETE FROM GLSETTLEMENTDETAILS GLS WHERE GLS.CLEARINGSESSIONID IN (
+    SELECT CS.Id FROM CLEARINGSESSIONS CS WHERE ArchivalId IN (SELECT Id FROM TEMPINDEX));
+    T2 := SYSTIMESTAMP;
+     DBMS_OUTPUT.PUT_LINE(' DELETE GLSETTLEMENTDETAILS ' || SQL%rowcount ||  (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- CLEARINGSESSIONS - DELETE
+    DELETE FROM CLEARINGSESSIONS WHERE ArchivalId IN (SELECT Id FROM TEMPINDEX);
+    T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE CLEARINGSESSIONS ' ||  SQL%rowcount || (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+  -- ======= TRANSACTIONCOMMENTS ==========
+
+    -- TRANSACTIONCOMMENTS - DELETE
+     OPEN curTable FOR SELECT TC.ROWID
+           FROM TRANSACTIONCOMMENTS TC
+            WHERE TargetType = 'TPH' AND TargetId IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);
+      LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+      EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONCOMMENTS
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+CLOSE curTable;
+
+--    DELETE FROM TRANSACTIONCOMMENTS
+--     WHERE TargetType = 'TPH' AND TargetId IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);
+  T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONCOMMENTS ' ||  SQL%rowcount || (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+  -- ======= VALIDATIONLOGDETAILS ==========
+
+    -- VALIDATIONLOGDETAILS - DELETE
+     OPEN curTable FOR SELECT VLOG.ROWID
+           FROM VALIDATIONLOGDETAILS VLOG
+             WHERE TARGETTYPE='T' AND TargetID IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);
+
+      LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+      EXIT WHEN tbl_rowid.COUNT =0;
+
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM VALIDATIONLOGDETAILS
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+    	CLOSE curTable;
+/*    DELETE FROM VALIDATIONLOGDETAILS
+     WHERE TARGETTYPE='T' AND TargetID IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);*/
+      T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE VALIDATIONLOGDETAILS (T) ' || SQL%rowcount ||  (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- VALIDATIONLOGDETAILS - DELETE
+
+     OPEN curTable FOR SELECT VLOG.ROWID
+          FROM VALIDATIONLOGDETAILS VLOG
+          WHERE TARGETTYPE='TPH' AND TargetID IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);
+
+      LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+      EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM VALIDATIONLOGDETAILS
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+    CLOSE curTable;
+  /*  DELETE FROM VALIDATIONLOGDETAILS
+     WHERE TARGETTYPE='TPH' AND TargetID IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);*/
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE VALIDATIONLOGDETAILS (tph) ' || SQL%rowcount ||  (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+     -- ======== GETTING ELIGIBLE BATCHES TO DELETE =============
+
+     INSERT INTO TEMP_TRAN
+     SELECT DISTINCT AchBatchId FROM TRANSACTIONPROCESSHEADER TPH
+     INNER JOIN TEMP_TRANIDS TT ON TT.TPHID = TPH.Id;
+
+
+     -- ======== GETTING ELIGIBLE BLOCKTICKETS TO DELETE =============
+
+		INSERT INTO TEMP_BLOCKTICKET
+          SELECT DISTINCT TPH.BLOCKTICKETID FROM TRANSACTIONPROCESSHEADER TPH
+					INNER JOIN TEMP_TRANIDS TT ON TT.TPHID = TPH.Id;
+
+
+    -- ======= TRANSACTION PROCESS HEADER ==========
+
+      -- TRANSACTIONPROCESSHEADER_hist - DELETE
+      OPEN curTable FOR SELECT TD.ROWID
+           FROM transactionprocessheader_hist TD
+           WHERE Id IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);
+
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+      EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM transactionprocessheader_hist
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+      CLOSE curTable;
+    T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE Transactionprocessheader_Hist  ' || SQL%rowcount ||  (T2-T1));
+     T1 := SYSTIMESTAMP;
+    -- TRANSACTIONPROCESSHEADER - DELETE
+     OPEN curTable FOR SELECT TPH.ROWID
+           FROM TRANSACTIONPROCESSHEADER TPH
+     WHERE Id IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);
+
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+      EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONPROCESSHEADER
+            WHERE rowid = tbl_rowid(i);
+     END LOOP;
+      CLOSE curTable;
+/*    DELETE FROM TRANSACTIONPROCESSHEADER
+     WHERE Id IN (SELECT DISTINCT TPHId FROM TEMP_TRANIDS);*/
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONPROCESSHEADER  ' ||  SQL%rowcount || (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+  -- ======= TRANSACTIONS ==========
+
+    -- TRANSACTIONS_Hist - DELETE
+     OPEN curTable FOR SELECT TH.ROWID
+           FROM Transactions_Hist TH
+     WHERE AchTransactionId IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);
+LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+     EXIT WHEN tbl_rowid.COUNT =0;
+
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM Transactions_Hist
+            WHERE rowid = tbl_rowid(i);
+            END LOOP;
+      CLOSE curTable;
+ /*   DELETE FROM Transactions_Hist
+     WHERE AchTransactionId IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE Transactions_Hist  ' || tbl_rowid.COUNT || SQL%rowcount || (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- TRANSACTIONS - DELETE
+      OPEN curTable FOR SELECT T.ROWID
+           FROM TRANSACTIONS T
+     WHERE AchTransactionId IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 3000;
+    	 EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONS
+            WHERE rowid = tbl_rowid(i);
+                  END LOOP;
+      CLOSE curTable;
+  /*
+    DELETE FROM TRANSACTIONS
+     WHERE AchTransactionId IN (SELECT DISTINCT AchTransactionId FROM TEMP_TRANIDS);*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONS  ' ||  SQL%rowcount || (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+   -- ======= PAYMENTITEMS ==========
+
+    -- PAYMENTITEMS_HOST - DELETE
+
+      OPEN curTable FOR
+    SELECT PI_H.ROWID
+           FROM PAYMENTITEMS_HIST PI_H
+   WHERE PI_H.PaymentItemId IN (SELECT td.PaymentItemId FROM TEMP_TRANIDS td)
+   AND PI_H.PAYMENTITEMID NOT IN (SELECT td.PaymentItemId FROM TEMP_TRANIDS td
+   INNER JOIN TRANSACTIONS t ON td.paymentitemid = t.paymentitemid);
+   LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 500;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM PAYMENTITEMS_HIST
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+      CLOSE curTable;
+    /*DELETE FROM PAYMENTITEMS_HIST
+    WHERE PaymentItemId IN (SELECT PaymentItemId FROM TEMP_TRANIDS
+   WHERE PaymentItemId NOT IN (SELECT DISTINCT PaymentItemId FROM TRANSACTIONS));*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE PAYMENTITEMS_HIST  ' ||   (T2-T1));
+
+
+     T1 := SYSTIMESTAMP;
+    -- PAYMENTITEMS - DELETE
+      OPEN curTable FOR SELECT PI.ROWID
+           FROM PAYMENTITEMS PI
+    WHERE PI.PaymentItemId IN (SELECT td.PaymentItemId FROM TEMP_TRANIDS td)
+   AND PI.PAYMENTITEMID NOT IN (SELECT td.PaymentItemId FROM TEMP_TRANIDS td
+   INNER JOIN TRANSACTIONS t ON td.paymentitemid = t.paymentitemid);
+       LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid LIMIT 500;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM PAYMENTITEMS
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM PAYMENTITEMS
+    WHERE PaymentItemId IN (SELECT PaymentItemId FROM TEMP_TRANIDS
+    WHERE PaymentItemId NOT IN (SELECT DISTINCT PaymentItemId FROM TRANSACTIONS));*/
+
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE PAYMENTITEMS  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- ======= COUPONS ==========
+
+    -- COUPONS - DELETE
+     OPEN curTable FOR SELECT C.ROWID
+            FROM COUPONS C
+    WHERE PaymentItemId IN (SELECT PaymentItemId FROM TEMP_TRANIDS
+    WHERE PaymentItemId NOT IN (SELECT DISTINCT PaymentItemId FROM PAYMENTITEMS));
+    LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 1000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM COUPONS
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM COUPONS
+    WHERE PaymentItemId IN (SELECT PaymentItemId FROM TEMP_TRANIDS
+    WHERE PaymentItemId NOT IN (SELECT DISTINCT PaymentItemId FROM PAYMENTITEMS));*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE COUPONS  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+   -- ======= BATCH ==========
+
+    -- BATCH_hist - DELETE
+     OPEN curTable FOR SELECT B_H.ROWID
+            FROM Batch_Hist B_H
+     WHERE AchBatchId IN (SELECT DISTINCT AchBatchId FROM TEMP_TRAN
+     WHERE AchBatchId NOT IN (SELECT DISTINCT B.AchBatchId FROM BATCH_HIST B
+     INNER JOIN TRANSACTIONPROCESSHEADER TPH ON TPH.Achbatchid = B.Achbatchid));
+
+LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 3000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM Batch_Hist
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+   /* DELETE FROM Batch_Hist
+     WHERE AchBatchId IN (SELECT DISTINCT AchBatchId FROM TEMP_TRAN
+     WHERE AchBatchId NOT IN (SELECT DISTINCT B.AchBatchId FROM BATCH_HIST B
+     INNER JOIN TRANSACTIONPROCESSHEADER TPH ON TPH.Achbatchid = B.Achbatchid));*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE Batch_Hist  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- BATCH - DELETE
+      OPEN curTable FOR SELECT B.ROWID
+            FROM BATCH B
+     WHERE AchBatchId IN (SELECT DISTINCT AchBatchId FROM TEMP_TRAN
+     WHERE AchBatchId NOT IN (SELECT DISTINCT B.AchBatchId FROM BATCH B
+     INNER JOIN TRANSACTIONPROCESSHEADER TPH ON TPH.Achbatchid = B.Achbatchid));
+LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 3000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM BATCH
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+   /* DELETE FROM BATCH
+     WHERE AchBatchId IN (SELECT DISTINCT AchBatchId FROM TEMP_TRAN
+     WHERE AchBatchId NOT IN (SELECT DISTINCT B.AchBatchId FROM BATCH B
+     INNER JOIN TRANSACTIONPROCESSHEADER TPH ON TPH.Achbatchid = B.Achbatchid));*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE BATCH  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- ======= TRANSACTIONDETAILS ==========
+
+     -- TRANSACTIONDETAILS_hist - DELETE - FOR TRANSACTIONS
+     OPEN curTable FOR SELECT TD_H.ROWID
+            FROM TRANSACTIONDETAILS_HIST TD_H
+     WHERE TargetType = 'T' AND TargetID IN (SELECT AchTransactionId FROM TEMP_TRANIDS);
+LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS_HIST
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+    /* DELETE FROM TRANSACTIONDETAILS_HIST
+     WHERE TargetType = 'T' AND TargetID IN (SELECT AchTransactionId FROM TEMP_TRANIDS);*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS_HIST  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+     -- TRANSACTIONDETAILS - DELETE - FOR TRANSACTIONS
+       OPEN curTable FOR SELECT TD.ROWID
+           FROM TRANSACTIONDETAILS TD
+     WHERE TargetType = 'T' AND TargetID IN (SELECT AchTransactionId FROM TEMP_TRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS
+            WHERE rowid = tbl_rowid(i);
+     END LOOP;
+      CLOSE curTable;
+   /*  DELETE FROM TRANSACTIONDETAILS
+     WHERE TargetType = 'T' AND TargetID IN (SELECT AchTransactionId FROM TEMP_TRANIDS);*/
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+     -- TRANSACTIONDETAILS - DELETE  - FOR BATCH
+      OPEN curTable FOR SELECT TD_H.ROWID
+           FROM TRANSACTIONDETAILS_HIST TD_H
+     WHERE TargetType = 'B' AND TargetID NOT IN (SELECT AchBatchId FROM BATCH);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS_HIST
+            WHERE rowid = tbl_rowid(i);
+END LOOP;
+      CLOSE curTable;
+/*     DELETE FROM TRANSACTIONDETAILS_HIST
+     WHERE TargetType = 'B' AND TargetID NOT IN (SELECT AchBatchId FROM BATCH);
+*/       T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS_HIST  ' ||   (T2-T1));
+
+
+     T1 := SYSTIMESTAMP;
+        OPEN curTable FOR SELECT TD.ROWID
+           FROM TRANSACTIONDETAILS TD
+     WHERE TargetType = 'B' AND TargetID NOT IN (SELECT AchBatchId FROM BATCH);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS
+            WHERE rowid = tbl_rowid(i);
+END LOOP;
+      CLOSE curTable;
+    /* DELETE FROM TRANSACTIONDETAILS
+     WHERE TargetType = 'B' AND TargetID NOT IN (SELECT AchBatchId FROM BATCH);*/
+         T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS  ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- TRANSACTIONDETAILS - DELETE  - FOR COUPON
+       OPEN curTable FOR SELECT TD_H.ROWID
+           FROM TRANSACTIONDETAILS_HIST TD_H
+    WHERE TargetType = 'C' AND TargetID NOT IN (SELECT CouponId FROM COUPONS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS_HIST
+            WHERE rowid = tbl_rowid(i);
+         END LOOP;
+      CLOSE curTable;
+   /* DELETE FROM TRANSACTIONDETAILS_HIST
+    WHERE TargetType = 'C' AND TargetID NOT IN (SELECT CouponId FROM COUPONS);*/
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS_HIST (c) ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+       OPEN curTable FOR SELECT TD.ROWID
+           FROM TRANSACTIONDETAILS TD
+    WHERE TargetType = 'C' AND TargetID NOT IN (SELECT CouponId FROM COUPONS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS
+            WHERE rowid = tbl_rowid(i);
+         END LOOP;
+      CLOSE curTable;
+    /*DELETE FROM TRANSACTIONDETAILS
+    WHERE TargetType = 'C' AND TargetID NOT IN (SELECT CouponId FROM COUPONS);*/
+     T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS (c) ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- TRANSACTIONDETAILS - DELETE  - FOR PAYMENTITEM
+    OPEN curTable FOR SELECT TD_H.ROWID
+            FROM TRANSACTIONDETAILS_HIST TD_H
+    WHERE TargetType = 'P' AND TargetID
+    IN (SELECT PaymentItemId FROM TEMP_TRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS_HIST
+            WHERE rowid = tbl_rowid(i);
+         END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM TRANSACTIONDETAILS_HIST
+    WHERE TargetType = 'P' AND TargetID
+    --NOT IN (SELECT PaymentItemId FROM PAYMENTITEMS);
+    IN (SELECT PaymentItemId FROM TEMP_TRANIDS);*/
+     T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS_HIST (P) ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+
+ OPEN curTable FOR SELECT TD.ROWID
+            FROM TRANSACTIONDETAILS TD
+    WHERE TargetType = 'P' AND TargetID
+    IN (SELECT PaymentItemId FROM TEMP_TRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM TRANSACTIONDETAILS
+            WHERE rowid = tbl_rowid(i);
+      END LOOP;
+      CLOSE curTable;
+ /*   DELETE FROM TRANSACTIONDETAILS
+    WHERE TargetType = 'P' AND TargetID
+    --NOT IN (SELECT PaymentItemId FROM PAYMENTITEMS);
+    IN (SELECT PaymentItemId FROM TEMP_TRANIDS);*/
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TRANSACTIONDETAILS (P) ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+    -- ======= BLOCKTICKET ==========
+
+      -- BLOCKTICKET - DELETE
+      DELETE FROM BLOCKTICKET
+					WHERE BlockTicketId
+          IN (SELECT DISTINCT BlockTicketId FROM TEMP_BLOCKTICKET WHERE BlockTicketId
+					NOT IN (SELECT DISTINCT TPH.BlockTicketId FROM TRANSACTIONPROCESSHEADER TPH
+						  INNER JOIN TEMP_BLOCKTICKET BT ON BT.BlockTicketID = TPH.BLOCKTICKETID ));
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE BLOCKTICKET ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+    -- ======= EXCHANGE RELATED TABLES ==========
+
+    -- EXCHANGEOBJECTS - DELETE
+    DELETE FROM EXCHANGEOBJECTS
+     WHERE HeaderId IN (SELECT DISTINCT EH.HeaderID
+                          FROM EXCHANGEHEADER EH
+                         INNER JOIN TEMPINDEX TI ON EH.ArchivalId = TI.Id
+                         WHERE EH.ArchivalFlag IN ('2'));
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGEOBJECTS ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+    -- EXCHANGELOG - DELETE
+    DELETE FROM EXCHANGELOG
+     WHERE Header IN
+           (SELECT DISTINCT EHF.Header
+              FROM EXCHANGEHEADER EH
+             INNER JOIN TEMPINDEX TI ON EH.ArchivalId = TI.Id
+             INNER JOIN EXCHANGEHEADERFILES EHF ON EHF.Header = EH.HeaderID
+             WHERE EH.ArchivalFlag IN ('2'));
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGELOG ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+    -- EXCHANGEOBJECTDETAILS - DELETE
+       OPEN curTable FOR SELECT EOD.ROWID
+           FROM EXCHANGEOBJECTDETAILS EOD
+     WHERE FileId IN
+           (SELECT DISTINCT EHF."FILE"
+              FROM EXCHANGEHEADERFILES EHF
+             INNER JOIN EXCHANGEHEADER EH ON EHF.Header = EH.HeaderID
+             INNER JOIN TEMPINDEX TI ON EH.ArchivalId = TI.Id
+             WHERE EH.ArchivalFlag IN ('2'));
+     LOOP
+     FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+     EXIT WHEN tbl_rowid.COUNT =0;
+
+     FORALL i IN 1..tbl_rowid.COUNT
+           DELETE FROM EXCHANGEOBJECTDETAILS
+           WHERE rowid = tbl_rowid(i);
+     END LOOP;
+     CLOSE curTable;
+
+    /*  DELETE FROM EXCHANGEOBJECTDETAILS
+     WHERE FileId IN
+           (SELECT DISTINCT EHF."FILE"
+              FROM EXCHANGEHEADERFILES EHF
+             INNER JOIN EXCHANGEHEADER EH ON EHF.Header = EH.HeaderID
+             INNER JOIN TEMPINDEX TI ON EH.ArchivalId = TI.Id
+             WHERE EH.ArchivalFlag IN ('2'));*/
+	    T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGEOBJECTDETAILS ' ||   (T2-T1));
+
+    INSERT INTO TEMP_EXCHANGEFILES(FILEID)
+          SELECT DISTINCT EHF."FILE"
+              FROM EXCHANGEHEADERFILES EHF
+             INNER JOIN EXCHANGEHEADER EH ON EHF.Header = EH.HeaderID
+             INNER JOIN TEMPINDEX TI ON EH.ArchivalId = TI.Id
+             WHERE EH.ArchivalFlag IN ('2');
+
+
+     T1 := SYSTIMESTAMP;
+    -- EXCHANGEHEADERFILES - DELETE
+    DELETE FROM EXCHANGEHEADERFILES EHF
+     WHERE EHF."FILE" IN (SELECT TEF.FILEID FROM TEMP_EXCHANGEFILES TEF);
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGEHEADERFILES ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+    -- EXCHANGEFILES - DELETE
+    DELETE FROM EXCHANGEFILES
+     WHERE FileId IN
+           (SELECT TEF.FILEID FROM TEMP_EXCHANGEFILES TEF);
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGEFILES ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+    -- EXCHANGEHEADER - DELETE
+    	DELETE FROM EXCHANGEHEADER WHERE HeaderID IN (SELECT DISTINCT EH.HeaderID
+  					 FROM EXCHANGEHEADER EH
+						 INNER JOIN TEMPINDEX TI ON EH.ArchivalId = TI.Id
+						 WHERE EH.ARCHIVALFLAG ='2'
+						 );
+
+T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE EXCHANGEHEADER ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+
+    -- ======= KE RELATED TABLES ==========
+
+    -- KEINWARDCOMMISSIONS- DELETE
+      OPEN curTable FOR SELECT KEIC.ROWID
+            FROM KEINWARDCOMMISSIONS KEIC
+           WHERE ACHBATCHID NOT IN (SELECT ACHBatchId FROM BATCH);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KEINWARDCOMMISSIONS
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM KEINWARDCOMMISSIONS
+           WHERE ACHBATCHID NOT IN (SELECT ACHBatchId FROM BATCH);*/
+    T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KEINWARDCOMMISSIONS ' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+
+    -- KESETTLEMENTDETAILS - DELETE
+     OPEN curTable FOR SELECT KED.ROWID
+            FROM KESETTLEMENTDETAILS KED WHERE KED.SETTLEMENTID IN
+  	(SELECT KED.SETTLEMENTID FROM KESETTLEMENTDETAILS KED
+        INNER JOIN KESETTLEMENT KES ON KES.ID = KED.SETTLEMENTID
+	      INNER JOIN ARCHIVALINDEX AI ON TO_DATE(KES.SETTLEMENTDATE,'dd-mon-yy') = 	TO_DATE(AI.SESSIONDATE,'dd-mon-yy')
+        INNER JOIN TEMPINDEX TI ON TI.ID=AI.ARCHIVALID
+          );
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KESETTLEMENTDETAILS
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM KESETTLEMENTDETAILS KED WHERE KED.SETTLEMENTID IN
+  	(SELECT KED.SETTLEMENTID FROM KESETTLEMENTDETAILS KED
+        INNER JOIN KESETTLEMENT KES ON KES.ID = KED.SETTLEMENTID
+	      INNER JOIN ARCHIVALINDEX AI ON TO_DATE(KES.SETTLEMENTDATE,'dd-mon-yy') = 	TO_DATE(AI.SESSIONDATE,'dd-mon-yy')
+        INNER JOIN TEMPINDEX TI ON TI.ID=AI.ARCHIVALID
+          );*/
+        T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KESETTLEMENTDETAILS ' ||   (T2-T1));
+    T1 := SYSTIMESTAMP;
+
+    -- KESETTLEMENT - DELETE
+     OPEN curTable FOR SELECT KES.ROWID
+           FROM KESETTLEMENT KES WHERE KES.ID  IN
+  	(SELECT KES.ID FROM KESETTLEMENT KES
+	      INNER JOIN ARCHIVALINDEX AI ON TO_DATE(KES.SETTLEMENTDATE,'dd-mon-yy') = TO_DATE(AI.SESSIONDATE,'dd-mon-yy')
+        INNER JOIN TEMPINDEX TI ON TI.ID=AI.ARCHIVALID
+          );
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KESETTLEMENT
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM KESETTLEMENT KES WHERE KES.ID  IN
+  	(SELECT KES.ID FROM KESETTLEMENT KES
+	      INNER JOIN ARCHIVALINDEX AI ON TO_DATE(KES.SETTLEMENTDATE,'dd-mon-yy') = TO_DATE(AI.SESSIONDATE,'dd-mon-yy')
+        INNER JOIN TEMPINDEX TI ON TI.ID=AI.ARCHIVALID
+          );*/
+  T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KESETTLEMENT ' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+    --  "KETRANSACTIONS" - DELETE
+     OPEN curTable FOR SELECT KET.ROWID
+          FROM KETRANSACTIONS KET
+    WHERE Id IN (SELECT DISTINCT KETranId FROM TEMP_KETRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KETRANSACTIONS
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+   /* DELETE FROM KETRANSACTIONS
+    WHERE Id IN (SELECT DISTINCT KETranId FROM TEMP_KETRANIDS);*/
+ T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KETRANSACTIONS ' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+    -- "KEBATCHES"  - DELETE
+     OPEN curTable FOR SELECT KEB.ROWID
+          FROM KEBATCHES KEB
+    WHERE ID NOT IN (SELECT DISTINCT KT.KEBatchId FROM KETRANSACTIONS KT
+    INNER JOIN KEBATCHES KB ON KB.Id = KT.KEBATCHID
+    INNER JOIN TEMP_KETRANIDS TK ON TK.KEBATCHID = KB.ID
+    ) AND ID IN (SELECT KEBATCHID FROM TEMP_KETRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KEBATCHES
+            WHERE rowid = tbl_rowid(i);
+         END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM KEBATCHES
+    WHERE ID NOT IN (SELECT DISTINCT KT.KEBatchId FROM KETRANSACTIONS KT
+    INNER JOIN KEBATCHES KB ON KB.Id = KT.KEBATCHID
+    INNER JOIN TEMP_KETRANIDS TK ON TK.KEBATCHID = KB.ID
+    ) AND ID IN (SELECT KEBATCHID FROM TEMP_KETRANIDS);*/
+     T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KEBATCHES ' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+    --  "KETRAYS" TABLE DATA - DELETE
+      OPEN curTable FOR SELECT KETR.ROWID
+          FROM KETRAYS KETR
+    WHERE ID NOT IN (SELECT DISTINCT KB.KETrayId FROM KEBATCHES KB
+    INNER JOIN TEMP_KETRANIDS TK ON TK.KETRAYID = KB.KETrayId)
+    AND ID IN (SELECT KETRAYID FROM TEMP_KETRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KETRAYS
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+   /* DELETE FROM KETRAYS
+    WHERE ID NOT IN (SELECT DISTINCT KB.KETrayId FROM KEBATCHES KB
+    INNER JOIN TEMP_KETRANIDS TK ON TK.KETRAYID = KB.KETrayId)
+    AND ID IN (SELECT KETRAYID FROM TEMP_KETRANIDS);*/
+       T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KETRAY ' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+    -- "KEFILES" - DELETE
+     OPEN curTable FOR SELECT KEF.ROWID
+          FROM KEFILES KEF
+    WHERE  ID NOT IN (SELECT DISTINCT KT.KEFileId FROM KETRAYS KT
+    INNER JOIN TEMP_KETRANIDS TK ON TK.KEFileId = KT.KEFileId)
+    AND ID IN (SELECT KEFILEID FROM TEMP_KETRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 10000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM KEFILES
+            WHERE rowid = tbl_rowid(i);
+         END LOOP;
+      CLOSE curTable;
+    /*DELETE FROM KEFILES
+    WHERE  ID NOT IN (SELECT DISTINCT KT.KEFileId FROM KETRAYS KT
+    INNER JOIN TEMP_KETRANIDS TK ON TK.KEFileId = KT.KEFileId)
+    AND ID IN (SELECT KEFILEID FROM TEMP_KETRANIDS);*/
+          T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE KEFILES ' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+
+    -- ======= IMAGE DETAILS ==========
+
+     -- ImageDetails Delete (TRANSACTIONS)
+     INSERT INTO TEMPIMGSTODELETE(USERID, IMAGEREFID)
+            SELECT PPUSERID, IMG.IMAGEREFID
+            FROM IMAGEDETAILS IMG
+            WHERE TARGETTYPE = 'T' AND TARGETID IN (SELECT ACHTRANSACTIONID FROM TEMP_TRANIDS);
+
+      OPEN curTable FOR SELECT IMG.ROWID
+         FROM IMAGEDETAILS IMG
+    WHERE TARGETTYPE = 'T' AND TARGETID IN (SELECT ACHTRANSACTIONID FROM TEMP_TRANIDS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 1000;
+    EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM IMAGEDETAILS
+            WHERE rowid = tbl_rowid(i);
+    END LOOP;
+      CLOSE curTable;
+   /* DELETE FROM IMAGEDETAILS
+    WHERE TARGETTYPE = 'T' AND TARGETID IN (SELECT ACHTRANSACTIONID FROM TEMP_TRANIDS);*/
+               T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE IMAGEDETAILS (t)' ||   (T2-T1));
+     T1 := SYSTIMESTAMP;
+    -- ImageDetails Delete (COUPONS)
+     INSERT INTO TEMPIMGSTODELETE(USERID, IMAGEREFID)
+            SELECT PPUSERID, IMG.IMAGEREFID
+            FROM IMAGEDETAILS IMG
+            WHERE TARGETTYPE = 'C' AND TARGETID NOT IN (SELECT CouponId FROM COUPONS);
+
+     OPEN curTable FOR SELECT IMG.ROWID
+       FROM IMAGEDETAILS IMG
+    WHERE TARGETTYPE = 'C' AND TARGETID NOT IN (SELECT CouponId FROM COUPONS);
+     LOOP
+      FETCH curTable BULK COLLECT INTO tbl_rowid limit 1000;
+    	EXIT WHEN tbl_rowid.COUNT =0;
+
+      FORALL i IN 1..tbl_rowid.COUNT
+            DELETE FROM IMAGEDETAILS
+            WHERE rowid = tbl_rowid(i);
+         END LOOP;
+      CLOSE curTable;
+  /*  DELETE FROM IMAGEDETAILS
+    WHERE TARGETTYPE = 'C' AND TARGETID NOT IN (SELECT CouponId FROM COUPONS);*/
+                  T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE IMAGEDETAILS (c) ' ||   (T2-T1));
+
+     T1 := SYSTIMESTAMP;
+  DELETE FROM TMP_BATCH WHERE ArchivalId IN (SELECT Id FROM TEMPINDEX);
+              T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' DELETE TMP_BATCH  ' ||  (T2-T1));
+
+  END IF;
+
+
+
+  -- ARCHIVALINDEX - UPDATE
+    T1 := SYSTIMESTAMP;
+  UPDATE ARCHIVALINDEX
+     SET STATUS           = v_FinalStatus,
+         LastModifiedBy   = v_UserName,
+         LastModifiedDate = ppCurrentDateTime
+   WHERE ArchivalId IN (SELECT Id FROM TEMPINDEX);
+            T2 := SYSTIMESTAMP;
+    DBMS_OUTPUT.PUT_LINE(' UPDATE ARCHIVALINDEX  ' ||   (T2-T1));
+    
+    EXECUTE IMMEDIATE 'ALTER TRIGGER TRIG_TRANSACTIONDETAILS_DEL ENABLE';
+    OPEN PORARC1 FOR
+         SELECT * FROM TEMPIMGSTODELETE;
+-------------- END OF PROCEDURE --------------
+END;
+ 
